@@ -23,22 +23,23 @@ package ipset
 
 import (
 	"context"
-	"fmt"
+	"strings"
+
 	"github.com/IrineSistiana/mosdns/v4/coremain"
 	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
 	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
 	"github.com/miekg/dns"
-	"github.com/nadoo/ipset"
+	"github.com/vishvananda/netlink"
 	"go.uber.org/zap"
-	"net/netip"
+	"golang.org/x/sys/unix"
 )
 
 var _ coremain.ExecutablePlugin = (*ipsetPlugin)(nil)
 
 type ipsetPlugin struct {
 	*coremain.BP
-	args *Args
-	nl   *ipset.NetLink
+	args   *Args
+	handle *netlink.Handle
 }
 
 func newIpsetPlugin(bp *coremain.BP, args *Args) (*ipsetPlugin, error) {
@@ -49,15 +50,17 @@ func newIpsetPlugin(bp *coremain.BP, args *Args) (*ipsetPlugin, error) {
 		args.Mask6 = 32
 	}
 
-	nl, err := ipset.Init()
+	// Explicitly initialize with ONLY NETLINK_NETFILTER to avoid
+	// "protocol not supported" errors on restricted environments.
+	h, err := netlink.NewHandle(unix.NETLINK_NETFILTER)
 	if err != nil {
 		return nil, err
 	}
 
 	return &ipsetPlugin{
-		BP:   bp,
-		args: args,
-		nl:   nl,
+		BP:     bp,
+		args:   args,
+		handle: h,
 	}, nil
 }
 
@@ -74,21 +77,30 @@ func (p *ipsetPlugin) Exec(ctx context.Context, qCtx *query_context.Context, nex
 }
 
 func (p *ipsetPlugin) Close() error {
-	return p.nl.Close()
+	p.handle.Close()
+	return nil
 }
 
 func (p *ipsetPlugin) addIPSet(r *dns.Msg) error {
+	if len(r.Question) == 0 {
+		return nil
+	}
+
+	comment := "DNS: " + strings.TrimSuffix(r.Question[0].Name, ".")
+
 	for i := range r.Answer {
 		switch rr := r.Answer[i].(type) {
 		case *dns.A:
 			if len(p.args.SetName4) == 0 {
 				continue
 			}
-			addr, ok := netip.AddrFromSlice(rr.A.To4())
-			if !ok {
-				return fmt.Errorf("invalid A record with ip: %s", rr.A)
+			entry := &netlink.IPSetEntry{
+				IP:      rr.A,
+				CIDR:    uint8(p.args.Mask4),
+				Comment: comment,
+				Replace: true,
 			}
-			if err := ipset.AddPrefix(p.nl, p.args.SetName4, netip.PrefixFrom(addr, p.args.Mask4)); err != nil {
+			if err := p.handle.IpsetAdd(p.args.SetName4, entry); err != nil {
 				return err
 			}
 
@@ -96,11 +108,13 @@ func (p *ipsetPlugin) addIPSet(r *dns.Msg) error {
 			if len(p.args.SetName6) == 0 {
 				continue
 			}
-			addr, ok := netip.AddrFromSlice(rr.AAAA.To16())
-			if !ok {
-				return fmt.Errorf("invalid AAAA record with ip: %s", rr.AAAA)
+			entry := &netlink.IPSetEntry{
+				IP:      rr.AAAA,
+				CIDR:    uint8(p.args.Mask6),
+				Comment: comment,
+				Replace: true,
 			}
-			if err := ipset.AddPrefix(p.nl, p.args.SetName6, netip.PrefixFrom(addr, p.args.Mask6)); err != nil {
+			if err := p.handle.IpsetAdd(p.args.SetName6, entry); err != nil {
 				return err
 			}
 		default:
